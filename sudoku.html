@@ -8,6 +8,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
 <!-- Jitsi Meet — используется через iframe, SDK не нужен -->
 <style>
 /* ===== RESET & BASE ===== */
@@ -1782,14 +1783,50 @@ if(window.location.protocol==='file:') document.getElementById('file-warn').clas
 // Restore LiveKit settings UI
 setTimeout(initCallModeUI, 500);
 
-let auth, db;
+let auth, db, _fcmMessaging;
+const FCM_VAPID = 'BFcFlQ97vm3M9S-6Nd4bcfHeXj-tRSMR-9xKyXIC1wMC2kbvV-QO154iR9UN5F02bLz78qgu5FgEPGabzq3cO5I';
 try {
   firebase.initializeApp(FB_CFG);
   auth = firebase.auth();
   auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(()=>{});
   db = firebase.database();
   db.goOnline();
+  if ('serviceWorker' in navigator && firebase.messaging) _fcmMessaging = firebase.messaging();
 } catch(e) { console.error('Firebase init:', e); }
+
+async function initFCM() {
+  if (!_fcmMessaging || !('serviceWorker' in navigator)) return;
+  try {
+    const sw = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {scope:'/'});
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') return;
+    const token = await _fcmMessaging.getToken({ vapidKey: FCM_VAPID, serviceWorkerRegistration: sw });
+    if (token && ME) {
+      const k = 'tok_' + token.slice(-15).replace(/[^a-zA-Z0-9]/g,'_');
+      db.ref('users/' + ME.uid + '/fcmTokens/' + k).set({ token, updated: Date.now() });
+    }
+    _fcmMessaging.onMessage(payload => {
+      const d = payload.data || payload.notification || {};
+      if (d.type === 'call') {
+        const el = document.getElementById('callIncoming');
+        if (el && !el.classList.contains('show')) {
+          const nm = el.querySelector('.call-name'); if (nm) nm.innerText = d.callerName || d.from || '?';
+          el.classList.add('show');
+          if (navigator.vibrate) navigator.vibrate([400,200,400,200,400]);
+        }
+      } else {
+        showNotifBanner({ from: d.from||d.title, msg: d.body||d.msg, cid: d.cid, fromUid: d.fromUid, time: Date.now() });
+      }
+    });
+    navigator.serviceWorker.addEventListener('message', ev => {
+      if (ev.data?.type !== 'NOTIF_CLICK') return;
+      const { data, action } = ev.data;
+      if (action === 'accept') { window.acceptZegoOrOldCall && window.acceptZegoOrOldCall(); return; }
+      if (data.cid && data.fromUid) db.ref('users/'+data.fromUid).once('value').then(s=>{const u=s.val();if(u)openChat(data.cid,u,data.fromUid);});
+      else go('main');
+    });
+  } catch(e) { console.error('[FCM]', e); }
+}
 
 // ===== GLOBALS =====
 let ME = null, myProfile = null, currentChat = null, currentChatId = null;
@@ -1992,6 +2029,7 @@ auth && auth.onAuthStateChanged(async user => {
     listenVideoCalls();
     listenGameInvites();
     askNotifPerm();
+    initFCM();
     updateStreak();
     initColorPicker();
     calcCacheSize();
@@ -2663,10 +2701,13 @@ async function pushMsg(m) {
   const otherUid = currentChat?.otherUid;
   if (otherUid) {
     db.ref('conversations/' + cid + '/unread/' + otherUid).transaction(v => (v || 0) + 1);
+    const _sName = (myProfile?.firstName||'')+(myProfile?.lastName?' '+myProfile.lastName:'');
     db.ref('users/' + otherUid + '/notification').set({
-      from: (myProfile?.firstName || '') + (myProfile?.lastName ? ' ' + myProfile.lastName : ''),
-      msg: preview, cid, fromUid: ME.uid, time: Date.now()
+      from: _sName, msg: preview, cid, fromUid: ME.uid, time: Date.now()
     });
+    db.ref('fcm_queue/'+otherUid+'/pending').push({
+      type:'message', title:'🍯 '+_sName, body:preview, from:_sName, msg:preview, cid, fromUid:ME.uid, ts:Date.now()
+    }).catch(()=>{});
   }
 }
 
@@ -3600,6 +3641,12 @@ async function startWebRtcCall(isVideo) {
       callerColor: myProfile?.color || '#00c853',
       type: isVideo ? 'webrtc_video' : 'webrtc_voice'
     });
+    db.ref('fcm_queue/'+otherUid+'/pending').push({
+      type:'call', title:'📞 '+(myProfile?.firstName||'Звонок'),
+      body: isVideo?'📹 Видеозвонок':'📞 Голосовой звонок',
+      from: myProfile?.firstName||'?', callerName: myProfile?.firstName||'?',
+      cid: callId, fromUid: ME.uid, ts: Date.now()
+    }).catch(()=>{});
 
     if (isVideo) document.getElementById('rtcVideoStat').innerText = '⏳ Ожидание...';
     else document.getElementById('rtcVoiceStat').innerText = '⏳ Ожидание...';
@@ -6101,6 +6148,88 @@ window.addEventListener('keydown',e=>{const dirs={ArrowUp:[0,-1],ArrowDown:[0,1]
 let t2048x=0,t2048y=0;
 document.addEventListener('touchstart',e=>{if(e.target.closest('.game-2048')||e.target.closest('#t2048Grid')){t2048x=e.touches[0].clientX;t2048y=e.touches[0].clientY;}},{passive:true});
 document.addEventListener('touchend',e=>{if(!e.target.closest('.game-2048')&&!e.target.closest('#t2048Grid'))return;const dx=e.changedTouches[0].clientX-t2048x,dy=e.changedTouches[0].clientY-t2048y;if(Math.abs(dx)>Math.abs(dy))move2048(dx>0?'right':'left');else move2048(dy>0?'down':'up');},{passive:true});
+
+// ===== НОВЫЕ ФИЧИ =====
+
+// Счётчик непрочитанных в заголовке вкладки
+function updateTabBadge(n) {
+  document.title = n > 0 ? '('+n+') Грильяж' : 'Грильяж';
+  if ('setAppBadge' in navigator) n > 0 ? navigator.setAppBadge(n).catch(()=>{}) : navigator.clearAppBadge().catch(()=>{});
+}
+(function(){
+  const _rc = typeof renderConvs === 'function' ? renderConvs : null;
+  if (!_rc) return;
+  window.renderConvs = function(data) {
+    _rc(data);
+    if (!ME || !data) return;
+    let t = 0;
+    Object.values(data).forEach(c => { if (c.unread && c.unread[ME.uid]) t += c.unread[ME.uid]; });
+    updateTabBadge(t);
+  };
+})();
+
+// Черновик сообщения
+document.addEventListener('input', e => {
+  if (e.target.id !== 'msgInp' || !currentChatId) return;
+  clearTimeout(window._draftT);
+  window._draftT = setTimeout(() => {
+    e.target.value.trim()
+      ? localStorage.setItem('draft_'+currentChatId, e.target.value)
+      : localStorage.removeItem('draft_'+currentChatId);
+  }, 800);
+});
+(function(){
+  const _oc = typeof openChat === 'function' ? openChat : null;
+  if (!_oc) return;
+  window.openChat = function(cid, user, otherUid) {
+    _oc(cid, user, otherUid);
+    setTimeout(() => {
+      const inp = document.getElementById('msgInp');
+      if (!inp || !cid) return;
+      const d = localStorage.getItem('draft_'+cid);
+      if (d) { inp.value = d; inp.style.height = 'auto'; inp.style.height = Math.min(inp.scrollHeight,120)+'px'; }
+    }, 300);
+  };
+})();
+
+// Двойной тап = реакция ❤️
+(function(){
+  let lt=0, lel=null;
+  document.addEventListener('touchend', e => {
+    const mb = e.target.closest('.msg-bubble'); if (!mb) return;
+    const now = Date.now();
+    if (now-lt < 350 && lel===mb) {
+      const key = mb.dataset.key;
+      if (key && currentChatId && ME) {
+        const h = document.createElement('div');
+        h.innerText='❤️';
+        h.style.cssText='position:fixed;font-size:28px;pointer-events:none;z-index:9999;left:'+(e.changedTouches[0].clientX-14)+'px;top:'+(e.changedTouches[0].clientY-14)+'px;animation:_hpop .7s ease forwards;';
+        document.body.appendChild(h);
+        setTimeout(()=>h.remove(),700);
+        db.ref('conversations/'+currentChatId+'/messages/'+key+'/reactions/heart').transaction(v=>(v||0)+1);
+        if (navigator.vibrate) navigator.vibrate(30);
+      }
+      lt=0; lel=null;
+    } else { lt=now; lel=mb; }
+  },{passive:true});
+})();
+(function(){
+  const s=document.createElement('style');
+  s.textContent='@keyframes _hpop{0%{transform:scale(0) translateY(0);opacity:1}60%{transform:scale(1.4) translateY(-20px);opacity:1}100%{transform:scale(1) translateY(-50px);opacity:0}}';
+  document.head.appendChild(s);
+})();
+
+// Красная полоска — нет интернета
+(function(){
+  const b=document.createElement('div');
+  b.style.cssText='position:fixed;top:0;left:0;right:0;height:3px;background:#ff5252;z-index:9999;opacity:0;transition:opacity .4s;pointer-events:none;';
+  document.body.appendChild(b);
+  function setNet(on){b.style.opacity=on?'0':'1';}
+  window.addEventListener('online',()=>setNet(true));
+  window.addEventListener('offline',()=>setNet(false));
+  if(!navigator.onLine) setNet(false);
+})();
+
 </script>
 </body>
 </html>
